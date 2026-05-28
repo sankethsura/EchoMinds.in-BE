@@ -1,6 +1,8 @@
 import uuid
+import secrets
 import logging
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -187,6 +189,123 @@ async def create_outbound_trunk(body: OutboundTrunkSetup) -> dict[str, str]:
     except Exception as exc:
         logger.error("Failed to create outbound trunk: %s", exc)
         raise HTTPException(status_code=500, detail=f"Failed to create trunk: {exc}") from exc
+
+
+# ── Twilio auto-setup ─────────────────────────────────────────────────────────
+
+class TwilioSetup(BaseModel):
+    account_sid: str
+    auth_token: str
+
+
+@app.post("/create-twilio-trunk")
+async def create_twilio_trunk(body: TwilioSetup) -> dict[str, str]:
+    """
+    Fully automated Twilio → LiveKit outbound trunk setup.
+    1. Creates a Twilio Elastic SIP Trunk
+    2. Creates a SIP Credential List + credentials
+    3. Associates the credential list with the trunk
+    4. Creates the LiveKit outbound trunk
+    Returns the LiveKit trunk ID — add it to LIVEKIT_SIP_TRUNK_ID and restart.
+    """
+    auth = (body.account_sid, body.auth_token)
+    twilio_api = "https://api.twilio.com/2010-04-01"
+    trunking_api = "https://trunking.twilio.com/v1"
+    domain_label = f"echominds-{uuid.uuid4().hex[:8]}"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Step 1: Create Twilio SIP Trunk
+        trunk_r = await client.post(
+            f"{trunking_api}/Trunks",
+            data={
+                "FriendlyName": "EchoMinds Outbound",
+                "DomainName": f"{domain_label}.pstn.twilio.com",
+            },
+            auth=auth,
+        )
+        if trunk_r.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Twilio trunk creation failed ({trunk_r.status_code}): {trunk_r.text}",
+            )
+        twilio_trunk = trunk_r.json()
+        trunk_sid: str = twilio_trunk["sid"]
+        sip_domain: str = twilio_trunk["domain_name"]
+        logger.info("Twilio trunk created: %s domain=%s", trunk_sid, sip_domain)
+
+        # Step 2: Create SIP Credential List
+        cl_r = await client.post(
+            f"{twilio_api}/Accounts/{body.account_sid}/SIP/CredentialLists.json",
+            data={"FriendlyName": "EchoMinds Credentials"},
+            auth=auth,
+        )
+        if cl_r.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Credential list creation failed: {cl_r.text}",
+            )
+        cl_sid: str = cl_r.json()["sid"]
+
+        # Step 3: Add username + password to the credential list
+        sip_username = "echominds"
+        sip_password = secrets.token_urlsafe(20)
+        cred_r = await client.post(
+            f"{twilio_api}/Accounts/{body.account_sid}/SIP/CredentialLists/{cl_sid}/Credentials.json",
+            data={"Username": sip_username, "Password": sip_password},
+            auth=auth,
+        )
+        if cred_r.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Credential creation failed: {cred_r.text}",
+            )
+
+        # Step 4: Associate credential list with the Twilio trunk
+        assoc_r = await client.post(
+            f"{trunking_api}/Trunks/{trunk_sid}/CredentialLists",
+            data={"CredentialListSid": cl_sid},
+            auth=auth,
+        )
+        if assoc_r.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Credential list association failed: {assoc_r.text}",
+            )
+
+    # Step 5: Create LiveKit outbound SIP trunk pointing at Twilio
+    try:
+        async with LiveKitAPI(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        ) as lk:
+            lk_trunk = await lk.sip.create_sip_outbound_trunk(
+                CreateSIPOutboundTrunkRequest(
+                    trunk=SIPOutboundTrunkInfo(
+                        name="EchoMinds Twilio Outbound",
+                        address=sip_domain,
+                        auth_username=sip_username,
+                        auth_password=sip_password,
+                        transport=SIPTransport.SIP_TRANSPORT_AUTO,
+                    )
+                )
+            )
+    except Exception as exc:
+        logger.error("LiveKit trunk creation failed: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Twilio trunk ready but LiveKit trunk creation failed: {exc}",
+        ) from exc
+
+    logger.info(
+        "Full setup complete: twilio=%s livekit=%s domain=%s",
+        trunk_sid, lk_trunk.sip_trunk_id, sip_domain,
+    )
+    return {
+        "trunk_id": lk_trunk.sip_trunk_id,
+        "twilio_trunk_sid": trunk_sid,
+        "sip_domain": sip_domain,
+    }
 
 
 # ── Inbound call feature ───────────────────────────────────────────────────────
