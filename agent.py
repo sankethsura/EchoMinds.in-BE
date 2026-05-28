@@ -80,6 +80,29 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.error("session.start() failed:\n%s", traceback.format_exc())
         raise
 
+    # For outbound phone calls, wait for the SIP participant to answer before greeting.
+    # Voice chat rooms are named "echominds-{id}", phone call rooms "echominds-call-{id}".
+    is_phone_call = ctx.room.name.startswith("echominds-call-")
+
+    if is_phone_call:
+        logger.info("Outbound call room — waiting for SIP participant to answer")
+        try:
+            deadline = asyncio.get_event_loop().time() + 60  # 60 s dial timeout
+            while asyncio.get_event_loop().time() < deadline:
+                if any(
+                    p.identity == "phone-user"
+                    for p in ctx.room.remote_participants.values()
+                ):
+                    logger.info("SIP participant joined — starting conversation")
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                logger.warning("SIP participant never joined within 60 s — ending")
+                return
+        except Exception:
+            logger.error("Error waiting for SIP participant:\n%s", traceback.format_exc())
+            return
+
     try:
         logger.info("Sending greeting")
         await session.say(
