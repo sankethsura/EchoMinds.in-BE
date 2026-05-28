@@ -57,6 +57,16 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/debug-config")
+async def debug_config() -> dict:
+    return {
+        "livekit_url": settings.livekit_url,
+        "api_key_prefix": settings.livekit_api_key[:6] + "...",
+        "sip_trunk_id": settings.livekit_sip_trunk_id or "(not set)",
+        "sip_enabled": settings.sip_enabled,
+    }
+
+
 @app.get("/token")
 async def get_token(
     room: str = Query(default=None),
@@ -199,6 +209,7 @@ async def create_outbound_trunk(body: OutboundTrunkSetup) -> dict[str, str]:
 class TwilioSetup(BaseModel):
     account_sid: str
     auth_token: str
+    twilio_number: str
 
 
 @app.post("/create-twilio-trunk")
@@ -217,7 +228,14 @@ async def create_twilio_trunk(body: TwilioSetup) -> dict[str, str]:
     domain_label = f"echominds-{uuid.uuid4().hex[:8]}"
 
     async with httpx.AsyncClient(timeout=30) as client:
-        # Step 1: Create Twilio SIP Trunk
+        # Step 1: Delete any existing trunk (trial accounts allow only one)
+        list_r = await client.get(f"{trunking_api}/Trunks", auth=auth)
+        if list_r.status_code == 200:
+            for trunk in list_r.json().get("trunks", []):
+                await client.delete(f"{trunking_api}/Trunks/{trunk['sid']}", auth=auth)
+                logger.info("Deleted existing Twilio trunk: %s", trunk["sid"])
+
+        # Step 2: Create Twilio SIP Trunk
         trunk_r = await client.post(
             f"{trunking_api}/Trunks",
             data={
@@ -236,7 +254,21 @@ async def create_twilio_trunk(body: TwilioSetup) -> dict[str, str]:
         sip_domain: str = twilio_trunk["domain_name"]
         logger.info("Twilio trunk created: %s domain=%s", trunk_sid, sip_domain)
 
-        # Step 2: Create SIP Credential List
+        # Step 2: Delete any existing "EchoMinds Credentials" lists
+        cls_r = await client.get(
+            f"{twilio_api}/Accounts/{body.account_sid}/SIP/CredentialLists.json",
+            auth=auth,
+        )
+        if cls_r.status_code == 200:
+            for cl in cls_r.json().get("credential_lists", []):
+                if cl.get("friendly_name") == "EchoMinds Credentials":
+                    await client.delete(
+                        f"{twilio_api}/Accounts/{body.account_sid}/SIP/CredentialLists/{cl['sid']}.json",
+                        auth=auth,
+                    )
+                    logger.info("Deleted existing credential list: %s", cl["sid"])
+
+        # Step 3: Create SIP Credential List
         cl_r = await client.post(
             f"{twilio_api}/Accounts/{body.account_sid}/SIP/CredentialLists.json",
             data={"FriendlyName": "EchoMinds Credentials"},
@@ -249,7 +281,7 @@ async def create_twilio_trunk(body: TwilioSetup) -> dict[str, str]:
             )
         cl_sid: str = cl_r.json()["sid"]
 
-        # Step 3: Add username + password to the credential list
+        # Step 4: Add username + password to the credential list
         sip_username = "echominds"
         sip_password = secrets.token_urlsafe(20)
         cred_r = await client.post(
@@ -263,7 +295,7 @@ async def create_twilio_trunk(body: TwilioSetup) -> dict[str, str]:
                 detail=f"Credential creation failed: {cred_r.text}",
             )
 
-        # Step 4: Associate credential list with the Twilio trunk
+        # Step 5: Associate credential list with the Twilio trunk
         assoc_r = await client.post(
             f"{trunking_api}/Trunks/{trunk_sid}/CredentialLists",
             data={"CredentialListSid": cl_sid},
@@ -287,6 +319,7 @@ async def create_twilio_trunk(body: TwilioSetup) -> dict[str, str]:
                     trunk=SIPOutboundTrunkInfo(
                         name="EchoMinds Twilio Outbound",
                         address=sip_domain,
+                        numbers=[body.twilio_number],
                         auth_username=sip_username,
                         auth_password=sip_password,
                         transport=SIPTransport.SIP_TRANSPORT_AUTO,
