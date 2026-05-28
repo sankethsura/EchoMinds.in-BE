@@ -125,7 +125,15 @@ async def start_call(body: CallRequest) -> dict[str, str]:
                         sip_info.participant_identity, room_name, body.phone_number)
     except Exception as exc:
         logger.error("SIP call failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Failed to place call: {exc}") from exc
+        msg = str(exc)
+        if "not_found" in msg or "404" in msg:
+            detail = (
+                "Outbound SIP trunk not found. Make sure LIVEKIT_SIP_TRUNK_ID is set to an "
+                "outbound trunk ID (starts with ST_). Inbound trunk IDs cannot be used for outbound calls."
+            )
+        else:
+            detail = f"Failed to place call: {exc}"
+        raise HTTPException(status_code=500, detail=detail) from exc
 
     return {
         "token": token,
