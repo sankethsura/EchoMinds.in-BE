@@ -30,7 +30,12 @@ Guidelines:
 def prewarm(proc: JobProcess) -> None:
     logger.info("Prewarming — loading Silero VAD model")
     try:
-        proc.userdata["vad"] = silero.VAD.load()
+        proc.userdata["vad"] = silero.VAD.load(
+            min_silence_duration=0.2,       # declare end-of-speech sooner
+            min_speech_duration=0.05,       # detect speech onset faster
+            activation_threshold=0.5,
+            deactivation_threshold=0.35,
+        )
         logger.info("VAD model loaded successfully")
     except Exception:
         logger.error("VAD prewarm failed:\n%s", traceback.format_exc())
@@ -61,6 +66,11 @@ async def entrypoint(ctx: JobContext) -> None:
             llm=openai.LLM(model="gpt-4o-mini"),
             tts=deepgram.TTS(model="aura-2-andromeda-en"),
             allow_interruptions=True,
+            # Respond faster: wait only 300 ms of silence before processing the turn
+            min_endpointing_delay=0.3,
+            # Stop speaking immediately when the user says even a short phrase
+            min_interruption_duration=0.2,
+            min_interruption_words=0,
         )
 
         @session.on("agent_state_changed")
