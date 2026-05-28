@@ -8,6 +8,9 @@ from livekit.api import AccessToken, VideoGrants, LiveKitAPI
 from livekit.protocol.room import ListRoomsRequest
 from livekit.protocol.sip import (
     CreateSIPParticipantRequest,
+    CreateSIPOutboundTrunkRequest,
+    SIPOutboundTrunkInfo,
+    SIPTransport,
     CreateSIPDispatchRuleRequest,
     SIPDispatchRule,
     SIPDispatchRuleIndividual,
@@ -147,6 +150,43 @@ async def start_call(body: CallRequest) -> dict[str, str]:
 @app.get("/sip-status")
 async def sip_status() -> dict[str, bool]:
     return {"enabled": settings.sip_enabled}
+
+
+class OutboundTrunkSetup(BaseModel):
+    address: str = "voice.plivo.com"
+    username: str
+    password: str
+    name: str = "EchoMinds Outbound"
+
+
+@app.post("/create-outbound-trunk")
+async def create_outbound_trunk(body: OutboundTrunkSetup) -> dict[str, str]:
+    """
+    Creates a LiveKit outbound SIP trunk using the supplied provider credentials.
+    Returns the trunk ID — add it to LIVEKIT_SIP_TRUNK_ID in your backend env.
+    """
+    try:
+        async with LiveKitAPI(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        ) as lk:
+            trunk = await lk.sip.create_sip_outbound_trunk(
+                CreateSIPOutboundTrunkRequest(
+                    trunk=SIPOutboundTrunkInfo(
+                        name=body.name,
+                        address=body.address,
+                        auth_username=body.username,
+                        auth_password=body.password,
+                        transport=SIPTransport.SIP_TRANSPORT_AUTO,
+                    )
+                )
+            )
+            logger.info("Created outbound SIP trunk: %s", trunk.sip_trunk_id)
+            return {"trunk_id": trunk.sip_trunk_id}
+    except Exception as exc:
+        logger.error("Failed to create outbound trunk: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to create trunk: {exc}") from exc
 
 
 # ── Inbound call feature ───────────────────────────────────────────────────────
