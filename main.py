@@ -5,7 +5,14 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from livekit.api import AccessToken, VideoGrants, LiveKitAPI
-from livekit.protocol.sip import CreateSIPParticipantRequest
+from livekit.protocol.room import ListRoomsRequest
+from livekit.protocol.sip import (
+    CreateSIPParticipantRequest,
+    CreateSIPDispatchRuleRequest,
+    SIPDispatchRule,
+    SIPDispatchRuleIndividual,
+    ListSIPDispatchRuleRequest,
+)
 
 from config import settings
 
@@ -132,3 +139,101 @@ async def start_call(body: CallRequest) -> dict[str, str]:
 @app.get("/sip-status")
 async def sip_status() -> dict[str, bool]:
     return {"enabled": settings.sip_enabled}
+
+
+# ── Inbound call feature ───────────────────────────────────────────────────────
+
+INBOUND_ROOM_PREFIX = "echominds-inbound-"
+
+
+async def _get_dispatch_rule_id() -> str | None:
+    try:
+        async with LiveKitAPI(
+            url=settings.livekit_url,
+            api_key=settings.livekit_api_key,
+            api_secret=settings.livekit_api_secret,
+        ) as lk:
+            resp = await lk.sip.list_sip_dispatch_rules(
+                ListSIPDispatchRuleRequest(trunk_ids=[settings.livekit_sip_inbound_trunk_id])
+            )
+            return resp.items[0].sip_dispatch_rule_id if resp.items else None
+    except Exception:
+        return None
+
+
+@app.get("/inbound-status")
+async def inbound_status() -> dict:
+    if not settings.inbound_enabled:
+        return {"enabled": False, "phone_number": "", "dispatch_rule_id": None}
+    dispatch_rule_id = await _get_dispatch_rule_id()
+    return {
+        "enabled": True,
+        "phone_number": settings.livekit_inbound_phone_number,
+        "dispatch_rule_id": dispatch_rule_id,
+    }
+
+
+@app.post("/setup-inbound")
+async def setup_inbound() -> dict:
+    if not settings.inbound_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Inbound SIP trunk not configured. Set LIVEKIT_SIP_INBOUND_TRUNK_ID.",
+        )
+    async with LiveKitAPI(
+        url=settings.livekit_url,
+        api_key=settings.livekit_api_key,
+        api_secret=settings.livekit_api_secret,
+    ) as lk:
+        existing = await lk.sip.list_sip_dispatch_rules(
+            ListSIPDispatchRuleRequest(trunk_ids=[settings.livekit_sip_inbound_trunk_id])
+        )
+        if existing.items:
+            rule_id = existing.items[0].sip_dispatch_rule_id
+            logger.info("Dispatch rule already exists: %s", rule_id)
+            return {"dispatch_rule_id": rule_id, "created": False}
+
+        rule = await lk.sip.create_sip_dispatch_rule(
+            CreateSIPDispatchRuleRequest(
+                trunk_ids=[settings.livekit_sip_inbound_trunk_id],
+                rule=SIPDispatchRule(
+                    dispatch_rule_individual=SIPDispatchRuleIndividual(
+                        room_prefix=INBOUND_ROOM_PREFIX,
+                    )
+                ),
+                name="EchoMinds Inbound",
+            )
+        )
+        logger.info("Created dispatch rule: %s", rule.sip_dispatch_rule_id)
+        return {"dispatch_rule_id": rule.sip_dispatch_rule_id, "created": True}
+
+
+@app.get("/active-calls")
+async def active_calls() -> dict:
+    if not settings.inbound_enabled:
+        return {"calls": []}
+    async with LiveKitAPI(
+        url=settings.livekit_url,
+        api_key=settings.livekit_api_key,
+        api_secret=settings.livekit_api_secret,
+    ) as lk:
+        rooms_resp = await lk.room.list_rooms(ListRoomsRequest())
+    calls = [
+        {"room": r.name, "num_participants": r.num_participants}
+        for r in rooms_resp.rooms
+        if r.name.startswith(INBOUND_ROOM_PREFIX)
+    ]
+    return {"calls": calls}
+
+
+@app.get("/monitor-call/{room_name:path}")
+async def monitor_call(room_name: str) -> dict[str, str]:
+    if not room_name.startswith(INBOUND_ROOM_PREFIX):
+        raise HTTPException(status_code=400, detail="Invalid room name")
+    identity = f"monitor-{uuid.uuid4().hex[:6]}"
+    try:
+        token = _issue_token(room_name, identity, can_publish=False)
+    except Exception as exc:
+        logger.error("Token generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to generate token") from exc
+    return {"token": token, "room": room_name, "url": settings.livekit_url, "identity": identity}

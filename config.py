@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     deepgram_api_key: str
     allowed_origins: str = "http://localhost:3000"
     livekit_sip_trunk_id: str = ""
+    livekit_sip_inbound_trunk_id: str = ""
+    livekit_inbound_phone_number: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -19,6 +21,10 @@ class Settings(BaseSettings):
     @property
     def sip_enabled(self) -> bool:
         return bool(self.livekit_sip_trunk_id)
+
+    @property
+    def inbound_enabled(self) -> bool:
+        return bool(self.livekit_sip_inbound_trunk_id)
 
 
 settings = Settings()
