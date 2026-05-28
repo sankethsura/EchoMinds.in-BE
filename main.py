@@ -83,6 +83,9 @@ class CallRequest(BaseModel):
     @field_validator("phone_number")
     @classmethod
     def validate_phone(cls, v: str) -> str:
+        v = v.strip()
+        if v.lower().startswith("sip:"):
+            return v  # pass SIP URIs through unchanged
         digits = "".join(c for c in v if c.isdigit() or c == "+")
         if not digits.startswith("+"):
             digits = "+" + digits
